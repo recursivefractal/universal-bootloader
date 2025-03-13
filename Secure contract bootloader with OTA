@@ -1,0 +1,530 @@
+/**
+ * Secure Contract Bootloader with OTA - Version 0.0.1
+ * 
+ * Copyright (c) 2025 Joseph Gutierrez
+ * 
+ * DUAL LICENSE:
+ * 
+ * 1. GNU Affero General Public License v3 (AGPLv3)
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the GNU Affero General Public License as published by
+ *    the Free Software Foundation, either version 3 of the License, or
+ *    (at your option) any later version.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ *    As per AGPL requirements, any modifications to this code must be made
+ *    available to recipients of the software under the same license terms.
+ *    If you run a modified version of this software as a network service,
+ *    you must make the complete source code available to users.
+ *
+ * 2. Enterprise License
+ *    For commercial or enterprise use that requires exclusivity, proprietary
+ *    deployment, or custom modifications without AGPL source disclosure
+ *    requirements, a separate Enterprise License is available. Contact
+ *    Joseph Gutierrez for enterprise licensing terms and pricing.
+ *    
+ *    The Enterprise License provides:
+ *    - Proprietary use rights without source disclosure requirements
+ *    - Technical support and maintenance services
+ *    - Custom implementation and integration services
+ *    - Legal indemnification protections
+ * 
+ * A minimal, secure implementation that integrates:
+ * 1. Core bootloader functionality
+ * 2. OTA security model
+ * 3. Lisp-based extensibility
+ * 
+ * This is an early development version (0.0.1) that implements only the basic
+ * bootloader functionality and OTA security. It is intended to be expanded to
+ * the full specification through future updates.
+ */
+
+// Minimal Lisp Runtime
+const Lisp = (function() {
+  function tokenize(code) {
+    code = code.replace(/\(/g, ' ( ').replace(/\)/g, ' ) ');
+    return code.split(/\s+/).filter(s => s.length > 0);
+  }
+
+  function parse(tokens) {
+    if (tokens.length === 0) throw new Error('Unexpected EOF');
+    const token = tokens.shift();
+    if (token === '(') {
+      const list = [];
+      while (tokens[0] !== ')') {
+        list.push(parse(tokens));
+        if (tokens.length === 0) throw new Error('Unexpected EOF');
+      }
+      tokens.shift(); // Remove closing paren
+      return list;
+    } else if (token === ')') {
+      throw new Error('Unexpected )');
+    } else {
+      return atom(token);
+    }
+  }
+
+  function atom(token) {
+    if (/^-?\d+$/.test(token)) return parseInt(token, 10);
+    if (/^-?\d+\.\d+$/.test(token)) return parseFloat(token);
+    if (token === '#t') return true;
+    if (token === '#f') return false;
+    if (token[0] === '"' && token[token.length - 1] === '"') return token.slice(1, -1);
+    return token;
+  }
+
+  function createEnv(parent = null) {
+    const env = Object.create(parent || null);
+    if (!parent) {
+      // Core functions only - minimal set
+      env['+'] = (...args) => args.reduce((a, b) => a + b, 0);
+      env['-'] = (a, ...args) => args.length ? args.reduce((acc, b) => acc - b, a) : -a;
+      env['*'] = (...args) => args.reduce((a, b) => a * b, 1);
+      env['/'] = (a, ...args) => args.reduce((acc, b) => acc / b, a);
+      env['='] = (a, b) => a === b;
+      env['<'] = (a, b) => a < b;
+      env['>'] = (a, b) => a > b;
+      env['list'] = (...args) => args;
+      env['car'] = (list) => list[0];
+      env['cdr'] = (list) => list.slice(1);
+      env['cons'] = (item, list) => [item, ...list];
+      env['null?'] = (x) => x === null || (Array.isArray(x) && x.length === 0);
+      env['filter'] = (fn, list) => list.filter(x => fn(x));
+      env['map'] = (fn, list) => list.map(x => fn(x));
+      env['assoc'] = (key, alist) => {
+        if (!Array.isArray(alist)) return null;
+        for (const pair of alist) {
+          if (Array.isArray(pair) && pair.length >= 2 && pair[0] === key) {
+            return pair;
+          }
+        }
+        return null;
+      };
+      env['define'] = (symbol, value) => { env[symbol] = value; return value; };
+      env['set!'] = (symbol, value) => {
+        let e = env;
+        while (e) {
+          if (Object.prototype.hasOwnProperty.call(e, symbol)) {
+            e[symbol] = value;
+            return value;
+          }
+          e = Object.getPrototypeOf(e);
+        }
+        throw new Error(`Cannot set undefined variable: ${symbol}`);
+      };
+      env['if'] = (condition, ifTrue, ifFalse) => {
+        return evaluate(condition, env) ? evaluate(ifTrue, env) : evaluate(ifFalse, env);
+      };
+      env['begin'] = (...expressions) => {
+        let result;
+        for (const expr of expressions) {
+          result = evaluate(expr, env);
+        }
+        return result;
+      };
+      env['lambda'] = (params, body) => {
+        return function(...args) {
+          const localEnv = createEnv(env);
+          params.forEach((param, i) => {
+            localEnv[param] = args[i];
+          });
+          return evaluate(body, localEnv);
+        };
+      };
+      env['display'] = (x) => { console.log(x); return x; };
+      env['eval'] = (expr) => evaluate(expr, env);
+    }
+    return env;
+  }
+
+  function evaluate(expr, env) {
+    if (typeof expr === 'number') return expr;
+    if (typeof expr === 'boolean') return expr;
+    if (typeof expr === 'string' && expr[0] === '"') return expr.slice(1, -1);
+    if (typeof expr === 'string') {
+      if (expr in env) return env[expr];
+      throw new Error(`Unknown symbol: ${expr}`);
+    }
+    if (expr.length === 0) return [];
+    
+    const op = expr[0];
+    
+    // Special forms
+    if (op === 'quote') return expr[1];
+    if (op === 'if') {
+      const [_, condition, ifTrue, ifFalse] = expr;
+      return evaluate(condition, env) ? evaluate(ifTrue, env) : evaluate(ifFalse, env);
+    }
+    if (op === 'define') {
+      const [_, name, value] = expr;
+      env[name] = evaluate(value, env);
+      return env[name];
+    }
+    if (op === 'set!') {
+      const [_, name, value] = expr;
+      let e = env;
+      while (e) {
+        if (Object.prototype.hasOwnProperty.call(e, name)) {
+          e[name] = evaluate(value, env);
+          return e[name];
+        }
+        e = Object.getPrototypeOf(e);
+      }
+      throw new Error(`Cannot set undefined variable: ${name}`);
+    }
+    if (op === 'lambda') {
+      const [_, params, body] = expr;
+      return function(...args) {
+        const localEnv = createEnv(env);
+        params.forEach((param, i) => {
+          localEnv[param] = args[i];
+        });
+        return evaluate(body, localEnv);
+      };
+    }
+    if (op === 'begin') {
+      let result;
+      for (let i = 1; i < expr.length; i++) {
+        result = evaluate(expr[i], env);
+      }
+      return result;
+    }
+    
+    // Function application
+    const fn = evaluate(op, env);
+    const args = expr.slice(1).map(arg => evaluate(arg, env));
+    
+    if (typeof fn !== 'function') {
+      throw new Error(`Not a function: ${op}`);
+    }
+    
+    return fn(...args);
+  }
+
+  const globalEnv = createEnv();
+  
+  return {
+    tokenize, parse, evaluate, createEnv, globalEnv,
+    parseAndEval: (code, env = globalEnv) => evaluate(parse(tokenize(code)), env)
+  };
+})();
+
+// Crypto utilities (minimal implementation)
+const Crypto = (function() {
+  // Generate key pair (simplified for demo)
+  function generateKeyPair() {
+    const privateKey = Array.from({length: 32}, () => 
+      Math.floor(Math.random() * 256).toString(16).padStart(2, '0')).join('');
+    const publicKey = privateKey.split('').reverse().join('');
+    return { privateKey, publicKey };
+  }
+  
+  // Sign data (simplified for demo)
+  function sign(data, privateKey) {
+    const hash = simpleHash(typeof data === 'string' ? data : JSON.stringify(data));
+    return hash + privateKey.substring(0, 8);
+  }
+  
+  // Verify signature (simplified for demo)
+  function verify(data, signature, publicKey) {
+    const hash = simpleHash(typeof data === 'string' ? data : JSON.stringify(data));
+    return signature.startsWith(hash);
+  }
+  
+  // Simple hash function (not secure, just for demo)
+  function simpleHash(data) {
+    let hash = 0;
+    for (let i = 0; i < data.length; i++) {
+      const char = data.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash;
+    }
+    return hash.toString(16);
+  }
+  
+  return { generateKeyPair, sign, verify };
+})();
+
+// Unified Bootloader
+const SecureBootloader = (function() {
+  // Private state
+  let state = 'Idle';
+  let version = '1.0.0';
+  const contracts = new Map();
+  const marketSegments = new Map();
+  const authorizedKeys = new Map();
+  const pendingUpdates = [];
+  
+  // Event system
+  const events = {};
+  
+  function on(event, handler) {
+    (events[event] = events[event] || []).push(handler);
+    return () => off(event, handler);
+  }
+  
+  function off(event, handler) {
+    if (!events[event]) return;
+    const idx = events[event].indexOf(handler);
+    if (idx >= 0) events[event].splice(idx, 1);
+  }
+  
+  function emit(event, data) {
+    if (!events[event]) return;
+    events[event].forEach(handler => handler(data));
+  }
+  
+  // Core validation logic
+  function validateContract(contract) {
+    // Required fields
+    if (!contract.id) return { valid: false, error: 'MISSING_ID' };
+    if (!contract.version) return { valid: false, error: 'MISSING_VERSION' };
+    if (!contract.segment) return { valid: false, error: 'MISSING_SEGMENT' };
+    
+    return { valid: true };
+  }
+  
+  // Contract submission
+  function submitContract(contract, origin) {
+    // State check
+    if (state !== 'Idle') {
+      return { success: false, error: 'INVALID_STATE' };
+    }
+    
+    // Transition to validation
+    state = 'Validation';
+    emit('state-change', { from: 'Idle', to: 'Validation' });
+    
+    // Validate
+    const validation = validateContract(contract);
+    if (!validation.valid) {
+      state = 'Idle';
+      emit('state-change', { from: 'Validation', to: 'Idle' });
+      emit('rejected', { contract, error: validation.error });
+      return { success: false, error: validation.error };
+    }
+    
+    // Register the contract
+    const enhancedContract = {
+      ...contract,
+      status: 'Active',
+      registrationTime: Date.now()
+    };
+    
+    contracts.set(contract.id, enhancedContract);
+    
+    // Add to market segment
+    if (!marketSegments.has(contract.segment)) {
+      marketSegments.set(contract.segment, []);
+    }
+    marketSegments.get(contract.segment).push(contract.id);
+    
+    // Transition to active
+    state = 'Active';
+    emit('state-change', { from: 'Validation', to: 'Active' });
+    emit('registered', { contract: enhancedContract });
+    
+    return { success: true, contract: enhancedContract };
+  }
+  
+  // Key management for OTA
+  function registerPublicKey(keyId, publicKey) {
+    authorizedKeys.set(keyId, publicKey);
+    emit('key-registered', { keyId });
+    return { success: true };
+  }
+  
+  // OTA update processing
+  function processUpdate(update) {
+    // Validate basic structure
+    if (!update.version || !update.code || !update.signature || !update.keyId) {
+      return { success: false, error: 'INVALID_PACKAGE_FORMAT' };
+    }
+    
+    // Check for authorized key
+    const publicKey = authorizedKeys.get(update.keyId);
+    if (!publicKey) {
+      return { success: false, error: 'UNAUTHORIZED_KEY' };
+    }
+    
+    // Verify signature
+    if (!Crypto.verify(update.code, update.signature, publicKey)) {
+      return { success: false, error: 'INVALID_SIGNATURE' };
+    }
+    
+    // Version check
+    if (compareVersions(update.version, version) < 0) {
+      return { success: false, error: 'VERSION_DOWNGRADE_REJECTED' };
+    }
+    
+    // Process based on target
+    if (update.target === 'self') {
+      return stageBootloaderUpdate(update);
+    } else {
+      return processContractUpdate(update);
+    }
+  }
+  
+  // Stage bootloader self-update
+  function stageBootloaderUpdate(update) {
+    pendingUpdates.push(update);
+    emit('update-staged', { 
+      version: update.version, 
+      target: 'self'
+    });
+    return { success: true, status: 'STAGED' };
+  }
+  
+  // Apply bootloader self-update
+  function applyPendingUpdates() {
+    if (pendingUpdates.length === 0) {
+      return { success: false, error: 'NO_PENDING_UPDATES' };
+    }
+    
+    // Get most recent update
+    const update = pendingUpdates[pendingUpdates.length - 1];
+    
+    try {
+      // Execute the update code (could extend functionality)
+      const lisp = Lisp;
+      lisp.parseAndEval(update.code);
+      
+      // Update version
+      version = update.version;
+      
+      // Clear pending updates
+      pendingUpdates.length = 0;
+      
+      emit('update-applied', {
+        version: update.version,
+        target: 'self',
+        status: 'SUCCESS'
+      });
+      
+      return { success: true, status: 'APPLIED' };
+    } catch (error) {
+      emit('update-failed', {
+        version: update.version,
+        target: 'self',
+        error: error.message
+      });
+      
+      return { success: false, error: error.message };
+    }
+  }
+  
+  // Process contract update
+  function processContractUpdate(update) {
+    try {
+      // Execute the update code
+      const lisp = Lisp;
+      lisp.parseAndEval(update.code);
+      
+      emit('update-applied', {
+        version: update.version,
+        target: update.contractId || 'contract',
+        status: 'SUCCESS'
+      });
+      
+      return { success: true, status: 'APPLIED' };
+    } catch (error) {
+      emit('update-failed', {
+        version: update.version,
+        target: update.contractId || 'contract',
+        error: error.message
+      });
+      
+      return { success: false, error: error.message };
+    }
+  }
+  
+  // Helper for comparing semantic versions
+  function compareVersions(v1, v2) {
+    const parts1 = v1.split('.').map(Number);
+    const parts2 = v2.split('.').map(Number);
+    
+    for (let i = 0; i < Math.max(parts1.length, parts2.length); i++) {
+      const part1 = parts1[i] || 0;
+      const part2 = parts2[i] || 0;
+      
+      if (part1 > part2) return 1;
+      if (part1 < part2) return -1;
+    }
+    
+    return 0; // Versions are equal
+  }
+  
+  // Reset for testing
+  function reset() {
+    state = 'Idle';
+    contracts.clear();
+    marketSegments.clear();
+    
+    // Don't clear authorized keys or pending updates
+    // for security reasons in a real implementation
+    
+    emit('reset', {});
+    
+    return { success: true };
+  }
+  
+  // Initialize with demo key
+  function initialize() {
+    // Generate a demo key pair
+    const keys = Crypto.generateKeyPair();
+    
+    // Register the public key
+    registerPublicKey('admin', keys.publicKey);
+    
+    return { 
+      success: true, 
+      privateKey: keys.privateKey,
+      publicKey: keys.publicKey
+    };
+  }
+  
+  // Public API
+  return {
+    // Core functions
+    submitContract,
+    getState: () => state,
+    getVersion: () => version,
+    
+    // OTA security
+    registerPublicKey,
+    processUpdate,
+    applyPendingUpdates,
+    
+    // Event system
+    on, off,
+    
+    // Helpers
+    reset,
+    initialize
+    
+    // Future extensions will be added via OTA updates
+    /* FUTURE EXTENSIONS (v1.0.1+)
+     * - Enhanced validation with dependency checking
+     * - Competitive weighting calculations
+     * - Market dynamics and conflict resolution
+     * - Multi-tier recovery model
+     * - Performance optimization via caching
+     */
+  };
+})();
+
+// Export for Node.js or browser
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { Lisp, Crypto, SecureBootloader };
+} else if (typeof window !== 'undefined') {
+  window.Lisp = Lisp;
+  window.Crypto = Crypto;
+  window.SecureBootloader = SecureBootloader;
+}
